@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 // ── Config ────────────────────────────────────────────────────────────────────
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const REFRESH_INTERVAL = 45_000; // 45 seconds
+const TOP_N = 5; // max size of the running leaderboard
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function probColor(prob) {
@@ -139,6 +140,22 @@ function TickerRow({ item, rank, isNew }) {
             item.rvol > 2 ? "#00ff88" : item.rvol > 1.5 ? "#ffe066" : "#ffffff50"
           } />
           <Pill label="MACD" value={macdBull ? "▲" : "▼"} color={macdBull ? "#00ff88" : "#ff5252"} />
+          <Pill label="EMA" value={
+            item.ema_stack?.stack === "bullish" ? "▲▲▲" :
+            item.ema_stack?.stack === "bearish" ? "▼▼▼" : "━ ━ ━"
+          } color={
+            item.ema_stack?.stack === "bullish" ? "#00ff88" :
+            item.ema_stack?.stack === "bearish" ? "#ff5252" : "#ffffff50"
+          } />
+          {item.ema_stack?.compressed && (
+            <Pill label="" value="COIL" color="#ffe066" />
+          )}
+          {item.fib?.near_key_fib && (
+            <Pill label="FIB" value={
+              Math.abs(item.fib.price_vs_fib_50_pct) < Math.abs(item.fib.price_vs_fib_618_pct)
+                ? "50%" : "61.8%"
+            } color="#a78bfa" />
+          )}
           <Pill label="ATR" value={item.atr_pct?.toFixed(1) + "%"} color="#4f8ef7" />
         </div>
       </td>
@@ -183,12 +200,13 @@ function TickerRow({ item, rank, isNew }) {
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
   const [data, setData] = useState(null);
+  const [leaderboard, setLeaderboard] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [elapsed, setElapsed] = useState(0);
-  const [prevTickers, setPrevTickers] = useState([]);
   const lastFetchRef = useRef(Date.now());
   const intervalRef = useRef(null);
+  const prevLeaderTickersRef = useRef([]); // for "new entrant" flash highlight
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -199,9 +217,21 @@ export default function App() {
       const r = await fetch(`${API_BASE}/api/screen`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const json = await r.json();
-      setPrevTickers(prev => {
-        setData(json);
-        return json.tickers?.map(t => t.ticker) || [];
+      setData(json);
+
+      // Merge new results into the running leaderboard:
+      // - existing tickers get refreshed with the latest prob/data
+      // - new tickers compete on prob; only top TOP_N survive
+      setLeaderboard(prev => {
+        prevLeaderTickersRef.current = prev.map(t => t.ticker);
+
+        const merged = new Map(prev.map(t => [t.ticker, t]));
+        for (const t of json.tickers || []) {
+          merged.set(t.ticker, t); // overwrite with fresh data if same ticker
+        }
+        return [...merged.values()]
+          .sort((a, b) => (b.prob ?? 0) - (a.prob ?? 0))
+          .slice(0, TOP_N);
       });
     } catch (e) {
       setError(e.message);
@@ -225,9 +255,9 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
-  const isNew = (ticker) => !prevTickers.includes(ticker);
+  const isNew = (ticker) => !prevLeaderTickersRef.current.includes(ticker);
   const secLeft = Math.max(0, Math.round((REFRESH_INTERVAL - elapsed) / 1000));
-  const tickers = data?.tickers || [];
+  const tickers = leaderboard;
 
   return (
     <div style={{

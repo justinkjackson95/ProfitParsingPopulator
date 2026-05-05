@@ -39,8 +39,26 @@ DEFAULT_TICKERS = [
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
 
+# In-memory cache: {ticker: (fetched_at, dataframe)}
+# Daily bars don't change intraday — once we have today's data it's good until
+# the next market close. 12h TTL keeps us under Alpha Vantage's 25/day free tier
+# regardless of how often the screener auto-refreshes.
+# TODO when going live: replace with yfinance / Finnhub for fresh intraday data.
+_BARS_CACHE: dict[str, tuple[datetime, pd.DataFrame]] = {}
+_CACHE_TTL = timedelta(hours=12)
+
+
 async def fetch_daily_bars(ticker: str, client: httpx.AsyncClient) -> Optional[pd.DataFrame]:
-    """Fetch 60 days of daily OHLCV from Alpha Vantage (free tier)."""
+    """Fetch 90 days of daily OHLCV. Cached in memory for 12h to spare API quota.
+    On rate-limit or API failure, falls back to stale cache if any exists."""
+    now = datetime.utcnow()
+
+    # 1. Fresh cache hit
+    cached = _BARS_CACHE.get(ticker)
+    if cached and (now - cached[0]) < _CACHE_TTL:
+        return cached[1]
+
+    # 2. Cache miss or expired — try the API
     url = (
         "https://www.alphavantage.co/query"
         f"?function=TIME_SERIES_DAILY&symbol={ticker}"
@@ -51,6 +69,11 @@ async def fetch_daily_bars(ticker: str, client: httpx.AsyncClient) -> Optional[p
         data = r.json()
         ts = data.get("Time Series (Daily)", {})
         if not ts:
+            # 3. API returned nothing (rate limit / quota / bad ticker).
+            #    Serve stale cache as a fallback so demos don't go blank.
+            if cached:
+                print(f"[cache] {ticker}: API empty, serving stale cache from {cached[0].isoformat()}Z")
+                return cached[1]
             return None
         rows = []
         for date_str, bar in sorted(ts.items()):
@@ -62,9 +85,15 @@ async def fetch_daily_bars(ticker: str, client: httpx.AsyncClient) -> Optional[p
                 "close": float(bar["4. close"]),
                 "volume": float(bar["5. volume"]),
             })
-        df = pd.DataFrame(rows).set_index("date").sort_index()
-        return df.tail(60)
-    except Exception:
+        df = pd.DataFrame(rows).set_index("date").sort_index().tail(90)
+        _BARS_CACHE[ticker] = (now, df)
+        print(f"[cache] {ticker}: fetched fresh, cached ({len(df)} bars)")
+        return df
+    except Exception as e:
+        # On any exception, serve stale if we have it
+        if cached:
+            print(f"[cache] {ticker}: fetch error {e!r}, serving stale cache")
+            return cached[1]
         return None
 
 
@@ -124,6 +153,68 @@ def compute_rvol(df: pd.DataFrame, period: int = 20) -> float:
     return round(float(rvol), 2)
 
 
+def compute_ema_stack(df: pd.DataFrame) -> dict:
+    """EMA 9/13/50 stack analysis: trend ordering + compression flag."""
+    closes = df["close"]
+    price = float(closes.iloc[-1])
+    ema9  = float(closes.ewm(span=9,  adjust=False).mean().iloc[-1])
+    ema13 = float(closes.ewm(span=13, adjust=False).mean().iloc[-1])
+    ema50 = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
+
+    if price > ema9 > ema13 > ema50:
+        stack = "bullish"
+    elif price < ema9 < ema13 < ema50:
+        stack = "bearish"
+    else:
+        stack = "mixed"
+
+    # Compression: EMA9 and EMA13 hugging each other often precedes a breakout
+    spread_9_13_pct = abs(ema9 - ema13) / ema13 * 100
+    compressed = spread_9_13_pct < 0.5
+
+    return {
+        "stack":           stack,
+        "compressed":      compressed,
+        "ema9":            round(ema9, 2),
+        "ema13":           round(ema13, 2),
+        "ema50":           round(ema50, 2),
+        "dist_ema9_pct":   round((price - ema9)  / ema9  * 100, 2),
+        "dist_ema50_pct": round((price - ema50) / ema50 * 100, 2),
+    }
+
+
+def compute_fib_levels(df: pd.DataFrame, window: int = 30) -> dict:
+    """50% and 61.8% Fibonacci retracements over the recent swing window."""
+    recent = df.tail(window)
+    swing_high = float(recent["high"].max())
+    swing_low  = float(recent["low"].min())
+    rng = swing_high - swing_low
+    price = float(df["close"].iloc[-1])
+
+    if rng == 0:
+        return {
+            "swing_high": swing_high, "swing_low": swing_low,
+            "fib_50": swing_high, "fib_618": swing_high,
+            "price_vs_fib_50_pct": 0.0, "price_vs_fib_618_pct": 0.0,
+            "near_key_fib": False,
+        }
+
+    fib_50  = swing_low + rng * 0.5
+    fib_618 = swing_low + rng * 0.618
+    dist_50_pct  = (price - fib_50)  / fib_50  * 100
+    dist_618_pct = (price - fib_618) / fib_618 * 100
+
+    return {
+        "swing_high":            round(swing_high, 2),
+        "swing_low":             round(swing_low, 2),
+        "fib_50":                round(fib_50, 2),
+        "fib_618":               round(fib_618, 2),
+        "price_vs_fib_50_pct":   round(dist_50_pct, 2),
+        "price_vs_fib_618_pct":  round(dist_618_pct, 2),
+        "near_key_fib":          abs(dist_50_pct) < 1.0 or abs(dist_618_pct) < 1.0,
+    }
+
+
 def compute_features(ticker: str, df: pd.DataFrame) -> dict:
     closes = df["close"]
     return {
@@ -132,6 +223,8 @@ def compute_features(ticker: str, df: pd.DataFrame) -> dict:
         "rsi":          compute_rsi(closes),
         "macd":         compute_macd(closes),
         "ema21_dist":   compute_ema_distance(closes, 21),
+        "ema_stack":    compute_ema_stack(df),
+        "fib":          compute_fib_levels(df),
         "atr_pct":      compute_atr(df),
         "rvol":         compute_rvol(df),
         "chg_1d_pct":   round(float((closes.iloc[-1] / closes.iloc[-2] - 1) * 100), 2),
@@ -149,14 +242,22 @@ Use ONLY the technical features provided. Do NOT rely on fundamental knowledge o
 Scoring framework:
 - RSI 50–70: bullish momentum (RSI > 80 = overextended risk; RSI < 40 = bearish)
 - MACD histogram turning positive / accelerating: bullish signal
+- EMA stack "bullish" (price > EMA9 > EMA13 > EMA50): strongest trend confirmation; "bearish" = fade; "mixed" = no clean trend
+- EMA compression (ema9_13 within 0.5%): coiling pattern — combined with RVOL > 1.5 this is a high-probability breakout setup
 - EMA-21 distance: +1% to +8% above = healthy trend; > +10% = extended
+- Fib retracement: when price is within 1% of the 50% or 61.8% level (near_key_fib=true) of the 30-day swing, it's a high-probability bounce/continuation zone — strongest when ema_stack is bullish (pullback in an uptrend)
 - ATR % (volatility): higher ATR = larger potential swing, but also more risk
 - RVOL > 1.5: institutional/unusual interest — strong signal
 - 1-day and 5-day % change: captures short-term price momentum
 
+Synergy patterns to favor (rank these higher):
+- ema_stack=bullish + near_key_fib=true + rvol > 1.5: textbook continuation entry
+- ema_stack=bullish + compressed=true + rvol rising: imminent breakout
+- ema_stack=mixed but RSI 55-65 + MACD hist accelerating: early trend reversal
+
 Return ONLY a valid JSON array (no markdown, no explanation) in this exact format:
 [
-  {"ticker": "XXXX", "prob": 0.72, "rationale": "one sentence"},
+  {{"ticker": "XXXX", "prob": 0.72, "rationale": "one sentence"}},
   ...
 ]
 
@@ -232,12 +333,21 @@ async def screen(tickers: str = ",".join(DEFAULT_TICKERS)):
 
     # Compute features for tickers with valid data
     features_list = []
+    skipped = []
     for ticker, df in zip(ticker_list, results):
-        if df is not None and len(df) >= 30:
-            try:
-                features_list.append(compute_features(ticker, df))
-            except Exception:
-                pass  # Skip tickers with insufficient data
+        if df is None:
+            skipped.append(f"{ticker}: no data (rate limit or fetch error)")
+            continue
+        if len(df) < 60:
+            skipped.append(f"{ticker}: only {len(df)} bars (need 60)")
+            continue
+        try:
+            features_list.append(compute_features(ticker, df))
+        except Exception as e:
+            skipped.append(f"{ticker}: {type(e).__name__}: {e}")
+    if skipped:
+        print(f"[screen] skipped {len(skipped)}/{len(ticker_list)}: {'; '.join(skipped[:5])}")
+    print(f"[screen] kept {len(features_list)} tickers")
 
     if not features_list:
         raise HTTPException(422, "No valid market data returned. Check your API key.")
